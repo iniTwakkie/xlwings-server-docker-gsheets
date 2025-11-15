@@ -14,7 +14,10 @@ services:
       - "8000:8000"
     volumes:
       - ./certs:/project/certs
+      - ./custom_scripts:/project/app/custom_scripts
+      - ./custom_functions:/project/app/custom_functions
     environment:
       XLWINGS_LICENSE_KEY: noncommercial
-      XLWINGS_ENVIRONMENT: prod
-      XLWINGS_ENABLE_SOCKETIO: false
+      XLWINGS_ENVIRONMENT: dev
+      XLWINGS_ENABLE_SOCKETIO: true
+      XLWINGS_ENABLE_WATCHDOG: true
