@@ -3,10 +3,18 @@ import requests
 import datetime as dt
 import xlwings as xw
 import re
+from urllib.parse import urlencode
+import uuid
 
 SETTINGS_SHEET_NAME = "Settings"
 TB_SHEET_NAME = "TB"
 COA_SHEET_NAME = "COA"
+XERO_REDIRECT_URI = "https://local-xlwings.danienell.com/xeroconnect"
+XERO_SCOPES = " ".join([
+    "offline_access",
+    "accounting.reports.read",
+    "accounting.settings.read",
+])
 
 @script
 def hello_world(book: xw.Book):
@@ -40,7 +48,6 @@ def yellow(book: xw.Book):
     # Return the following response
     return book.json()
 
-
 def _read_settings(sheet):
     # Read key/value pairs from Settings: A=key, B=value
     rng = sheet.range("A1").expand()
@@ -64,10 +71,16 @@ def _read_settings(sheet):
             continue
 
         key = str(raw_key).strip()
+
+        # Skip the header row "Key"
+        if key.lower() == "key":
+            continue
+
         value = row[1] if len(row) > 1 else None
         settings[key] = value
 
     return settings
+
 
 
 def _write_setting(sheet, key, value):
@@ -108,8 +121,6 @@ def _write_setting(sheet, key, value):
     next_row = num_rows + 1
     sheet[f"A{next_row}"].value = key_clean
     sheet[f"B{next_row}"].value = value
-
-
 
 
 def _get_access_token_from_refresh(settings, settings_sheet):
@@ -158,7 +169,6 @@ def _fetch_trial_balance(access_token, tenant_id, as_of_date=None):
     )
     resp.raise_for_status()
     return resp.json()
-
 
 
 def _flatten_trial_balance(tb_json, code_to_guid):
@@ -278,6 +288,7 @@ def _get_tb_meta(tb_json, fallback_date):
 
     return org_name, report_date
 
+
 def _fetch_accounts(access_token, tenant_id):
     resp = requests.get(
         "https://api.xero.com/api.xro/2.0/Accounts",
@@ -300,8 +311,6 @@ def _build_code_to_guid_map(accounts_json):
         if code and acc_id:
             mapping[code] = acc_id
     return mapping
-
-
 
 @script
 def xero_trial_balance(book: xw.Book):
@@ -389,7 +398,6 @@ def _fetch_organisation_name(access_token, tenant_id):
         return ""
     return orgs[0].get("Name", "")
 
-
 @script
 def xero_coa(book: xw.Book):
     """
@@ -449,62 +457,6 @@ def xero_coa(book: xw.Book):
 @script
 def fivetran_start_sync(book: xw.Book):
     """
-    Triggers a Fivetran sync for the connector in the Settings sheet
-    and writes a simple status into Main_Summary!G4.
-    """
-    try:
-        # 1) Load settings from Settings sheet
-        settings_sheet = book.sheets[SETTINGS_SHEET_NAME]
-        settings = _read_settings(settings_sheet)
-
-        connector_id = settings.get("FivetranConnectorID")
-        base64_key = settings.get("FivetranBase64APIkey")  # base64(api_key:api_secret)
-
-        if not connector_id or not base64_key:
-            sheet = book.sheets["Main_Summary"]
-            sheet["G4"].value = "Missing Fivetran settings"
-            return book.json()
-
-        # 2) Trigger sync
-        url = f"https://api.fivetran.com/v1/connectors/{connector_id}/sync"
-        payload = {"force": False}
-
-        headers = {
-            "Accept": "application/json;version=2",
-            "Authorization": f"Basic {base64_key}",
-            "Content-Type": "application/json",
-        }
-
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        response.raise_for_status()
-
-        response_data = response.json()
-        print("Fivetran sync response:", response_data)
-
-        # 3) Interpret response.code
-        code = (response_data.get("code") or "").lower()
-        if code == "success":
-            sync_state = "Syncing"
-        else:
-            sync_state = f"Not Syncing ({code or 'unknown'})"
-
-    except requests.HTTPError as exc:
-        print(f"Error triggering Fivetran sync: {exc}")
-        sync_state = f"Error: {exc}"
-
-    except Exception as e:
-        print(f"Unexpected error in fivetran_start_sync: {e}")
-        sync_state = f"Error: {e}"
-
-    # 4) Write status to Main_Summary!G4
-    sheet = book.sheets["Main_Summary"]
-    sheet["G4"].value = sync_state
-
-    return book.json()
-
-@script
-def fivetran_start_sync(book: xw.Book):
-    """
     Trigger a manual Fivetran sync and write a simple status to Main_Summary!G4
     """
     settings_sheet = book.sheets[SETTINGS_SHEET_NAME]
@@ -551,7 +503,6 @@ def fivetran_start_sync(book: xw.Book):
 
     sheet["G4"].value = sync_state
     return book.json()
-
 
 @script
 def fivetran_status(book: xw.Book):
@@ -607,3 +558,87 @@ def fivetran_status(book: xw.Book):
 
     sheet["G4"].value = sync_state
     return book.json()
+
+def _make_xero_auth_url(client_id: str, state: str) -> str:
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": XERO_REDIRECT_URI,
+        "scope": XERO_SCOPES,
+        "state": state,
+    }
+    return "https://login.xero.com/identity/connect/authorize?" + urlencode(params)
+
+
+@script
+def xero_connect_xw(book: xw.Book):
+    """
+    Start Xero OAuth flow:
+      - reads xero_client_id / xero_client_secret from Settings
+      - generates & stores xero_state
+      - builds the Xero auth URL
+      - stores xero_auth_url in Settings
+      - returns the workbook JSON (no extra payload)
+    """
+    settings_sheet = book.sheets[SETTINGS_SHEET_NAME]
+    settings = _read_settings(settings_sheet)
+
+    client_id = settings.get("xero_client_id")
+    client_secret = settings.get("xero_client_secret")
+
+    # No sheet writes, no custom JSON: just log and bail out
+    if not client_id or not client_secret:
+        print("xero_connect_xw: Missing xero_client_id or xero_client_secret")
+        return book.json()
+
+    # Generate new state and save it
+    state = uuid.uuid4().hex
+    _write_setting(settings_sheet, "xero_state", state)
+
+    # Build the OAuth URL
+    auth_url = _make_xero_auth_url(client_id, state)
+
+    # Save the auth_url into Settings
+    _write_setting(settings_sheet, "xero_auth_url", auth_url)
+
+    # Just return the standard workbook JSON (no arguments allowed here)
+    return book.json()
+
+@script
+def xero_choose_tenant(book: xw.Book, tenant_name: str):
+    """
+    Select a Xero tenant for this workbook:
+      - reads xero_connections_json from Settings
+      - finds the matching tenantName
+      - writes xero_tenant_id and xero_tenant_name into Settings
+    """
+    settings_sheet = book.sheets[SETTINGS_SHEET_NAME]
+    settings = _read_settings(settings_sheet)
+
+    connections_raw = settings.get("xero_connections_json")
+    if not connections_raw:
+        print("xero_choose_tenant: No xero_connections_json found in Settings.")
+        return book.json()
+
+    try:
+        connections = json.loads(connections_raw)
+    except Exception as e:
+        print(f"xero_choose_tenant: Failed to parse xero_connections_json: {e}")
+        return book.json()
+
+    match = None
+    for c in connections:
+        if c.get("tenantName") == tenant_name:
+            match = c
+            break
+
+    if not match:
+        print(f"xero_choose_tenant: tenantName {tenant_name!r} not found.")
+        return book.json()
+
+    _write_setting(settings_sheet, "xero_tenant_id", match.get("tenantId"))
+    _write_setting(settings_sheet, "xero_tenant_name", match.get("tenantName"))
+
+    print(f"xero_choose_tenant: Selected tenant {match.get('tenantName')} ({match.get('tenantId')})")
+    return book.json()
+
